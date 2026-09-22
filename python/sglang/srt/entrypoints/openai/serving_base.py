@@ -209,7 +209,9 @@ class OpenAIServingBase(ABC):
             param=param,
             code=status_code,
         )
-        return ORJSONResponse(content=error.model_dump(), status_code=status_code)
+        return ORJSONResponse(
+            content={"error": error.model_dump()}, status_code=status_code
+        )
 
     def create_streaming_error_response(
         self,
