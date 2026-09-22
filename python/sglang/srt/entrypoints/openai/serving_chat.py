@@ -101,6 +101,14 @@ logger = logging.getLogger(__name__)
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 
 
+class ToolChoiceViolation(ValueError):
+    """A generated tool call violated the request's tool-choice contract."""
+
+
+def _is_forced_tool_choice(tool_choice: Optional[Union[str, ToolChoice]]) -> bool:
+    return tool_choice == "required" or isinstance(tool_choice, ToolChoice)
+
+
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
 
@@ -739,6 +747,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens: Dict[int, int],
         reasoning_tokens: Dict[int, int],
         completion_tokens: Dict[int, int],
+        deferred_tool_chunks: Optional[Dict[int, List[str]]] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
         offset = stream_offsets.get(index, 0)
@@ -795,12 +804,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 has_tool_calls,
                 continuous_usage_stats,
                 flush=finish_reason_type is not None and finish_reason_type != "abort",
+                deferred_tool_chunks=deferred_tool_chunks,
             ):
                 if chunk:
                     yield chunk
 
             # Send any remaining tool call arguments when generation finishes
-            if finish_reason_type is not None and index in parser_dict:
+            if (
+                finish_reason_type is not None
+                and index in parser_dict
+                and not _is_forced_tool_choice(request.tool_choice)
+            ):
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
                     parser, content, request, index
@@ -1168,10 +1182,15 @@ class OpenAIServingChat(OpenAIServingBase):
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
+                selected_name = request.tool_choice.function.name
+                constraint_tools = [
+                    item
+                    for item in effective_tools
+                    if item.function.name == selected_name
+                ]
                 tools = [
                     item.model_dump()
-                    for item in request.tools or []
-                    if item.function.name == request.tool_choice.function.name
+                    for item in constraint_tools
                 ] or None
             elif request.tools:
                 tools = [item.model_dump() for item in request.tools]
@@ -1325,7 +1344,13 @@ class OpenAIServingChat(OpenAIServingBase):
             if messages[0]["role"] != "system":
                 # insert an empty system prompt to help render tool system prompt
                 messages.insert(0, {"role": "system", "content": ""})
-            if request.tools:
+            if tools is not None:
+                messages[0]["tools"] = tools
+            elif isinstance(request.tool_choice, ToolChoice):
+                # A named choice must never fall back to the full request tool
+                # list when the selected name is unavailable.
+                messages[0]["tools"] = []
+            elif request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
 
             # Default encoding (dsv4/dsv32)
@@ -1594,6 +1619,7 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
+        deferred_tool_chunks: Dict[int, List[str]] = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -1708,6 +1734,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
+                    deferred_tool_chunks=deferred_tool_chunks,
                 ):
                     yield chunk
 
@@ -1860,11 +1887,19 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_chat_response(
-            request,
-            ret,
-            int(time.time()),
-        )
+        try:
+            response = self._build_chat_response(
+                request,
+                ret,
+                int(time.time()),
+            )
+        except ToolChoiceViolation as e:
+            return self.create_error_response(
+                str(e),
+                err_type="InvalidRequestError",
+                status_code=422,
+                param="tool_choice",
+            )
 
         return response
 
@@ -1972,6 +2007,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
+                    request.parallel_tool_calls,
                 )
 
             # Extract prompt_token_ids if requested
@@ -2120,6 +2156,154 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         return tool_call_id
 
+    @staticmethod
+    def _tool_choice_name(tool_choice: Optional[Union[str, ToolChoice]]) -> Optional[str]:
+        if isinstance(tool_choice, ToolChoice):
+            return tool_choice.function.name
+        return None
+
+    @staticmethod
+    def _tool_function_field(tool: Any, field: str, default: Any = None) -> Any:
+        if isinstance(tool, dict):
+            return tool.get("function", {}).get(field, default)
+        return getattr(getattr(tool, "function", None), field, default)
+
+    @classmethod
+    def _tool_schema_error(
+        cls, name: str, arguments: Any, tools: List[Any]
+    ) -> Optional[str]:
+        if isinstance(arguments, str):
+            try:
+                arguments = orjson.loads(arguments)
+            except orjson.JSONDecodeError:
+                return f"Tool '{name}' returned invalid JSON arguments."
+        if not isinstance(arguments, dict):
+            return f"Tool '{name}' arguments must be a JSON object."
+
+        tool = next(
+            (tool for tool in tools if cls._tool_function_field(tool, "name") == name),
+            None,
+        )
+        schema = cls._tool_function_field(tool, "parameters") if tool else None
+        if not isinstance(schema, dict):
+            return None
+        try:
+            error = next(iter(Draft202012Validator(schema).iter_errors(arguments)), None)
+        except SchemaError:
+            # Request validation handles malformed schemas. Do not turn an
+            # unrelated schema implementation detail into a tool-choice failure.
+            return None
+        if error is None:
+            return None
+        path = ".".join(str(part) for part in error.absolute_path)
+        location = f" at '{path}'" if path else ""
+        return f"Tool '{name}' arguments violate its schema{location}: {error.message}"
+
+    def _validate_tool_choice_contract(
+        self,
+        tool_calls: Optional[List[ToolCall]],
+        tools: List[Any],
+        tool_choice: Optional[Union[str, ToolChoice]],
+        parallel_tool_calls: bool = True,
+    ) -> None:
+        """Validate a parsed response against required/named tool semantics."""
+        if not _is_forced_tool_choice(tool_choice):
+            return
+        if not tool_calls:
+            raise ToolChoiceViolation(
+                "tool_choice requires at least one valid tool call."
+            )
+
+        allowed_names = {
+            self._tool_function_field(tool, "name") for tool in tools
+        }
+        named_name = self._tool_choice_name(tool_choice)
+        if not parallel_tool_calls and len(tool_calls) > 1:
+            raise ToolChoiceViolation(
+                "parallel_tool_calls=false allows at most one tool call."
+            )
+
+        for call_index, call in enumerate(tool_calls):
+            name = call.function.name
+            if name not in allowed_names:
+                raise ToolChoiceViolation(
+                    f"Model returned tool '{name}', which was not provided in the request."
+                )
+            if named_name is not None and name != named_name:
+                raise ToolChoiceViolation(
+                    f"tool_choice requires '{named_name}', but model returned '{name}'."
+                )
+            schema_error = self._tool_schema_error(
+                name, call.function.arguments, tools
+            )
+            if schema_error:
+                raise ToolChoiceViolation(schema_error)
+            # The OpenAI index identifies the position in this response's
+            # tool_calls array, not the position of the function definition.
+            call.index = call_index
+
+    def _validate_stream_tool_call_name(
+        self,
+        call_item: ToolCallItem,
+        tools: List[Any],
+        tool_choice: Optional[Union[str, ToolChoice]],
+        parallel_tool_calls: bool,
+    ) -> None:
+        """Validate the irreversible function-name delta before it is emitted."""
+        if not _is_forced_tool_choice(tool_choice) or not call_item.name:
+            return
+        allowed_names = {
+            self._tool_function_field(tool, "name") for tool in tools
+        }
+        if call_item.name not in allowed_names:
+            raise ToolChoiceViolation(
+                f"Model returned tool '{call_item.name}', which was not provided in the request."
+            )
+        named_name = self._tool_choice_name(tool_choice)
+        if named_name is not None and call_item.name != named_name:
+            raise ToolChoiceViolation(
+                f"tool_choice requires '{named_name}', but model returned '{call_item.name}'."
+            )
+        if not parallel_tool_calls and call_item.tool_index > 0:
+            raise ToolChoiceViolation(
+                "parallel_tool_calls=false allows at most one tool call."
+            )
+
+    def _validate_stream_tool_call_state(
+        self,
+        parser: Union[FunctionCallParser, JsonArrayParser],
+        tools: List[Any],
+        tool_choice: Optional[Union[str, ToolChoice]],
+        parallel_tool_calls: bool,
+    ) -> None:
+        """Validate complete native parser state before releasing buffered deltas."""
+        if not _is_forced_tool_choice(tool_choice):
+            return
+        detector = getattr(parser, "detector", None)
+        records = getattr(detector, "prev_tool_call_arr", None)
+        if not records:
+            raise ToolChoiceViolation(
+                "tool_choice requires at least one valid tool call."
+            )
+        calls = []
+        for index, record in enumerate(records):
+            name = record.get("name") if isinstance(record, dict) else None
+            arguments = record.get("arguments") if isinstance(record, dict) else None
+            self._validate_stream_tool_call_name(
+                ToolCallItem(tool_index=index, name=name, parameters=""),
+                tools,
+                tool_choice,
+                parallel_tool_calls,
+            )
+            schema_error = self._tool_schema_error(name, arguments, tools)
+            if schema_error:
+                raise ToolChoiceViolation(schema_error)
+            calls.append(name)
+        if not parallel_tool_calls and len(calls) > 1:
+            raise ToolChoiceViolation(
+                "parallel_tool_calls=false allows at most one tool call."
+            )
+
     def _process_tool_calls(
         self,
         text: str,
@@ -2127,6 +2311,7 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: Dict[str, Any],
         tool_choice: Optional[Union[str, ToolChoice]] = None,
         history_tool_calls_cnt: int = 0,
+        parallel_tool_calls: bool = True,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -2158,6 +2343,10 @@ class OpenAIServingChat(OpenAIServingBase):
                             len(text),
                             text[:2000],
                         )
+                        if _is_forced_tool_choice(tool_choice):
+                            raise ToolChoiceViolation(
+                                "tool_choice requires at least one valid tool call."
+                            )
                         return ToolCallProcessingResult(None, text, finish_reason)
 
                     tool_calls = []
@@ -2168,29 +2357,33 @@ class OpenAIServingChat(OpenAIServingBase):
                         tool_calls.append(
                             ToolCall(
                                 id=tool_id,
-                                index=getattr(call_info, "tool_index", None),
+                                index=len(tool_calls),
                                 function=FunctionResponse(
                                     name=call_info.name,
                                     arguments=call_info.parameters,
                                 ),
                             )
                         )
+                    self._validate_tool_choice_contract(
+                        tool_calls,
+                        tools,
+                        tool_choice,
+                        parallel_tool_calls=parallel_tool_calls,
+                    )
                     if finish_reason["type"] == "stop":
                         finish_reason["type"] = "tool_calls"
                         finish_reason["matched"] = None
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
+                except ToolChoiceViolation:
+                    raise
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
                     return ToolCallProcessingResult(None, text, finish_reason)
 
             if is_required and detector_owns_format:
-                logger.warning(
-                    "Required tool call missing from %s output (%d chars)",
-                    self.tool_call_parser,
-                    len(text),
+                raise ToolChoiceViolation(
+                    "tool_choice requires at least one valid tool call."
                 )
-                logger.debug("Unparsed required tool call output: %r", text[:2000])
-                return ToolCallProcessingResult(None, text, finish_reason)
 
         # json_schema constraint → JSON array output for required/named
         if is_required:
@@ -2236,10 +2429,22 @@ class OpenAIServingChat(OpenAIServingBase):
                             ),
                         )
                     )
+                self._validate_tool_choice_contract(
+                    tool_calls,
+                    tools,
+                    tool_choice,
+                    parallel_tool_calls=parallel_tool_calls,
+                )
                 return ToolCallProcessingResult(tool_calls, "", finish_reason)
+            except ToolChoiceViolation:
+                raise
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
                 logger.debug("Unparsed required tool call output: %r", text[:2000])
+                if _is_forced_tool_choice(tool_choice):
+                    raise ToolChoiceViolation(
+                        "tool_choice requires at least one valid tool call."
+                    ) from e
                 finish_reason["type"] = original_finish_type
                 return ToolCallProcessingResult(None, text, finish_reason)
 
@@ -2566,6 +2771,7 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls: Dict[int, bool],
         continuous_usage_stats: bool = False,
         flush: bool = False,
+        deferred_tool_chunks: Optional[Dict[int, List[str]]] = None,
     ):
         """Process tool calls in streaming response.
 
@@ -2620,7 +2826,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 normal_text = (normal_text or "") + end_text
                 calls = list(calls) + end_calls
 
-        # Yield normal text
+        emitted_chunks: List[str] = []
+
+        # Build normal-text and tool-call chunks first. Required/named streams
+        # hold them until the complete native call has been validated, because
+        # an emitted function name cannot be retracted from an SSE stream.
         if normal_text:
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
@@ -2646,11 +2856,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            emitted_chunks.append(f"data: {chunk.model_dump_json()}\n\n")
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for call_item in calls:
+            self._validate_stream_tool_call_name(
+                call_item,
+                effective_tools,
+                request.tool_choice,
+                request.parallel_tool_calls,
+            )
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
 
@@ -2699,7 +2915,32 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            emitted_chunks.append(f"data: {chunk.model_dump_json()}\n\n")
+
+        defer_contract = (
+            _is_forced_tool_choice(request.tool_choice)
+            and hasattr(parser, "detector")
+            and parser.detector.parses_required_natively()
+        )
+        if defer_contract:
+            if deferred_tool_chunks is None:
+                deferred_tool_chunks = {}
+            pending = deferred_tool_chunks.setdefault(index, [])
+            pending.extend(emitted_chunks)
+            if flush:
+                self._validate_stream_tool_call_state(
+                    parser,
+                    effective_tools,
+                    request.tool_choice,
+                    request.parallel_tool_calls,
+                )
+                emitted_chunks = list(pending)
+                deferred_tool_chunks.pop(index, None)
+            else:
+                emitted_chunks = []
+
+        for chunk in emitted_chunks:
+            yield chunk
 
     def _check_for_unstreamed_tool_args(
         self,

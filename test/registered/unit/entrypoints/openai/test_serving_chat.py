@@ -28,12 +28,17 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    Function,
+    FunctionResponse,
     MessageProcessingResult,
+    Tool,
+    ToolCall,
     ToolChoice,
     ToolChoiceFuncName,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
+    ToolChoiceViolation,
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
@@ -1653,8 +1658,7 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[1].function.name, "get_weather")
 
     def test_required_tool_choice_skips_json_fallback_for_native_parser(self):
-        """A structural-tag parser owns the output format, so a missing tool
-        call must not be pushed through the json_schema array fallback."""
+        """A forced choice with no valid parser result is a contract error."""
         self.chat.tool_call_parser = "kimi_k3"
         tools = [
             {
@@ -1680,21 +1684,13 @@ class ServingChatTestCase(unittest.TestCase):
             for label, text in texts.items():
                 with self.subTest(tool_choice=choice, payload=label):
                     finish_reason = {"type": "stop", "matched": None}
-                    with self.assertLogs(
-                        "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
-                    ) as logs:
-                        tool_calls, remaining, finish_reason = (
-                            self.chat._process_tool_calls(
-                                text=text,
-                                tools=tools,
-                                finish_reason=finish_reason,
-                                tool_choice=choice,
-                            )
+                    with self.assertRaises(ToolChoiceViolation):
+                        self.chat._process_tool_calls(
+                            text=text,
+                            tools=tools,
+                            finish_reason=finish_reason,
+                            tool_choice=choice,
                         )
-                    self.assertIsNone(tool_calls)
-                    self.assertEqual(remaining, text)
-                    self.assertEqual(finish_reason["type"], "stop")
-                    self.assertNotIn("Tool call parsing error", "\n".join(logs.output))
 
     def test_truncated_native_tool_call_logs_and_drops(self):
         """A tools section cut off before its closing tag parses to zero calls
@@ -1716,21 +1712,30 @@ class ServingChatTestCase(unittest.TestCase):
         for choice in ("auto", "required"):
             with self.subTest(tool_choice=choice):
                 finish_reason = {"type": "stop", "matched": None}
-                with self.assertLogs(
-                    "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
-                ) as logs:
-                    tool_calls, remaining, finish_reason = (
+                if choice == "required":
+                    with self.assertRaises(ToolChoiceViolation):
                         self.chat._process_tool_calls(
                             text=truncated,
                             tools=tools,
                             finish_reason=finish_reason,
                             tool_choice=choice,
                         )
-                    )
-                self.assertIsNone(tool_calls)
-                self.assertEqual(remaining, "")
-                self.assertEqual(finish_reason["type"], "stop")
-                self.assertIn("no complete call", "\n".join(logs.output))
+                else:
+                    with self.assertLogs(
+                        "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+                    ) as logs:
+                        tool_calls, remaining, finish_reason = (
+                            self.chat._process_tool_calls(
+                                text=truncated,
+                                tools=tools,
+                                finish_reason=finish_reason,
+                                tool_choice=choice,
+                            )
+                        )
+                    self.assertIsNone(tool_calls)
+                    self.assertEqual(remaining, "")
+                    self.assertEqual(finish_reason["type"], "stop")
+                    self.assertIn("no complete call", "\n".join(logs.output))
 
     def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):
         """Parsers without a structural tag keep the JSON array fallback, but a
@@ -1773,18 +1778,13 @@ class ServingChatTestCase(unittest.TestCase):
                 self.assertEqual(finish_reason["type"], "tool_calls")
 
         finish_reason = {"type": "stop", "matched": None}
-        with self.assertLogs(
-            "sglang.srt.entrypoints.openai.serving_chat", level="ERROR"
-        ):
-            tool_calls, remaining, finish_reason = self.chat._process_tool_calls(
+        with self.assertRaises(ToolChoiceViolation):
+            self.chat._process_tool_calls(
                 text='["get_weather"]',
                 tools=tools,
                 finish_reason=finish_reason,
                 tool_choice="required",
             )
-        self.assertIsNone(tool_calls)
-        self.assertEqual(remaining, '["get_weather"]')
-        self.assertEqual(finish_reason["type"], "stop")
 
     def test_required_tool_choice_rejects_conflicting_output_constraint(self):
         """response_format and a forced tool call cannot both be honored: the
@@ -3430,7 +3430,7 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
             self.assertEqual(tool_calls[0].function.name, "get_weather")
             self.assertEqual(fr["type"], "tool_calls")
 
-    def test_empty_parser_result_is_not_reported_as_tool_call(self):
+    def test_empty_parser_result_is_a_tool_choice_error(self):
         with patch(
             "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
         ) as ParserMock:
@@ -3442,16 +3442,13 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
             finish_reason = {"type": "stop", "matched": None}
             tools = [{"type": "function", "function": {"name": "get_weather"}}]
 
-            tool_calls, text, fr = self.chat._process_tool_calls(
-                text="<|malformed_tool_call|>",
-                tools=tools,
-                finish_reason=finish_reason,
-                tool_choice="required",
-            )
-
-            self.assertIsNone(tool_calls)
-            self.assertEqual(text, "Visible prefix.")
-            self.assertEqual(fr, {"type": "stop", "matched": None})
+            with self.assertRaises(ToolChoiceViolation):
+                self.chat._process_tool_calls(
+                    text="<|malformed_tool_call|>",
+                    tools=tools,
+                    finish_reason=finish_reason,
+                    tool_choice="required",
+                )
 
     def test_required_without_parser_falls_back_to_json(self):
         """tool_choice='required' without parser should parse as JSON array."""
@@ -3471,21 +3468,65 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0].function.name, "get_weather")
 
-    def test_required_without_parser_invalid_json_returns_none(self):
-        """tool_choice='required' without parser and invalid JSON returns tool_calls=None."""
+    def test_required_without_parser_invalid_json_is_a_tool_choice_error(self):
+        """tool_choice='required' without parser rejects invalid JSON."""
         self.chat.tool_call_parser = None
 
         finish_reason = {"type": "stop", "matched": None}
         tools = [{"type": "function", "function": {"name": "get_weather"}}]
 
-        tool_calls, text, fr = self.chat._process_tool_calls(
-            text="<|tool_calls_section_begin|>not json",
-            tools=tools,
-            finish_reason=finish_reason,
-            tool_choice="required",
-        )
+        with self.assertRaises(ToolChoiceViolation):
+            self.chat._process_tool_calls(
+                text="<|tool_calls_section_begin|>not json",
+                tools=tools,
+                finish_reason=finish_reason,
+                tool_choice="required",
+            )
 
-        self.assertIsNone(tool_calls)
+    def test_forced_contract_rejects_wrong_name_and_invalid_arguments(self):
+        tools = [
+            Tool(
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "required": ["city"],
+                        "properties": {"city": {"type": "string"}},
+                    },
+                )
+            ),
+            Tool(function=Function(name="get_stock_price", parameters={"type": "object"})),
+        ]
+        named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+        wrong_name = [
+            ToolCall(function=FunctionResponse(name="get_stock_price", arguments="{}"))
+        ]
+        with self.assertRaises(ToolChoiceViolation):
+            self.chat._validate_tool_choice_contract(wrong_name, tools, named)
+
+        missing_required = [
+            ToolCall(function=FunctionResponse(name="get_weather", arguments="{}"))
+        ]
+        with self.assertRaises(ToolChoiceViolation):
+            self.chat._validate_tool_choice_contract(
+                missing_required, tools, named
+            )
+
+    def test_forced_contract_rejects_parallel_false_and_reindexes(self):
+        tools = [Tool(function=Function(name="get_weather", parameters={"type": "object"}))]
+        calls = [
+            ToolCall(index=7, function=FunctionResponse(name="get_weather", arguments="{}")),
+            ToolCall(index=9, function=FunctionResponse(name="get_weather", arguments="{}")),
+        ]
+        with self.assertRaises(ToolChoiceViolation):
+            self.chat._validate_tool_choice_contract(
+                calls, tools, "required", parallel_tool_calls=False
+            )
+
+        self.chat._validate_tool_choice_contract(
+            calls, tools, "required", parallel_tool_calls=True
+        )
+        self.assertEqual([call.index for call in calls], [0, 1])
 
 
 class TestNormalizeToolContent(unittest.TestCase):
