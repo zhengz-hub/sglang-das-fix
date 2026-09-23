@@ -3483,6 +3483,53 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
                 tool_choice="required",
             )
 
+    def test_pd_prefill_defers_forced_tool_contract_to_decode(self):
+        """Prefill emits an intermediate fragment, so only decode may reject it."""
+        self.chat.tool_call_parser = "deepseekv4"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Guangzhou?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"],
+                        },
+                    },
+                }
+            ],
+            tool_choice={
+                "type": "function",
+                "function": {"name": "get_weather"},
+            },
+        )
+        ret = [
+            {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-pd-prefill",
+                    "prompt_tokens": 32,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        self.chat.tokenizer_manager.server_args.disaggregation_mode = "prefill"
+        response = self.chat._build_chat_response(request, ret, created=0)
+        self.assertIsNone(response.choices[0].message.tool_calls)
+        self.assertEqual(self.chat._response_tool_choice(request), "auto")
+
+        self.chat.tokenizer_manager.server_args.disaggregation_mode = "decode"
+        with self.assertRaises(ToolChoiceViolation):
+            self.chat._build_chat_response(request, ret, created=0)
+
     def test_forced_contract_rejects_wrong_name_and_invalid_arguments(self):
         tools = [
             Tool(

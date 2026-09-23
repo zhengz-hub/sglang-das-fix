@@ -813,7 +813,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if (
                 finish_reason_type is not None
                 and index in parser_dict
-                and not _is_forced_tool_choice(request.tool_choice)
+                and not _is_forced_tool_choice(self._response_tool_choice(request))
             ):
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
@@ -882,6 +882,30 @@ class OpenAIServingChat(OpenAIServingBase):
             and self._effective_tools(request)
             and self.tool_call_parser
         )
+
+    def _response_tool_choice(
+        self, request: ChatCompletionRequest
+    ) -> Optional[Union[str, ToolChoice]]:
+        """Return the tool choice that is safe to enforce on this server.
+
+        A PD prefill response is an intermediate handoff result, not the final
+        assistant response. It can end after the first generated token, before
+        a native parser has enough text to recover an invocation. Enforcing a
+        required or named choice there rejects the request before decode can
+        finish it. Keep the original request unchanged for prompt construction,
+        but parse the intermediate response with auto semantics. Decode and
+        non-PD servers continue to enforce the complete response contract.
+        """
+        tool_choice = request.tool_choice
+        if (
+            getattr(
+                self.tokenizer_manager.server_args, "disaggregation_mode", "null"
+            )
+            == "prefill"
+            and _is_forced_tool_choice(tool_choice)
+        ):
+            return "auto"
+        return tool_choice
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
@@ -2005,7 +2029,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     text,
                     effective_tools,
                     finish_reason,
-                    request.tool_choice,
+                    self._response_tool_choice(request),
                     history_tool_calls_cnt,
                     request.parallel_tool_calls,
                 )
@@ -2779,9 +2803,10 @@ class OpenAIServingChat(OpenAIServingBase):
         held back waiting for a marker that can no longer arrive.
         """
         effective_tools = self._effective_tools(request)
+        response_tool_choice = self._response_tool_choice(request)
         if index not in parser_dict:
-            is_required = request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
+            is_required = response_tool_choice == "required" or isinstance(
+                response_tool_choice, ToolChoice
             )
             # For required/named tool choice: use JsonArrayParser when the
             # constrained output is plain JSON (detector doesn't support
@@ -2798,7 +2823,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     use_native_parser = (
                         probe.detector.supports_structural_tag_for_tool_choice(
-                            request.tool_choice
+                            response_tool_choice
                         )
                         or probe.detector.parses_required_natively()
                     )
@@ -2864,7 +2889,7 @@ class OpenAIServingChat(OpenAIServingBase):
             self._validate_stream_tool_call_name(
                 call_item,
                 effective_tools,
-                request.tool_choice,
+                response_tool_choice,
                 request.parallel_tool_calls,
             )
             # Mark that this choice has tool calls
@@ -2918,7 +2943,7 @@ class OpenAIServingChat(OpenAIServingBase):
             emitted_chunks.append(f"data: {chunk.model_dump_json()}\n\n")
 
         defer_contract = (
-            _is_forced_tool_choice(request.tool_choice)
+            _is_forced_tool_choice(response_tool_choice)
             and hasattr(parser, "detector")
             and parser.detector.parses_required_natively()
         )
@@ -2931,7 +2956,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._validate_stream_tool_call_state(
                     parser,
                     effective_tools,
-                    request.tool_choice,
+                    response_tool_choice,
                     request.parallel_tool_calls,
                 )
                 emitted_chunks = list(pending)
