@@ -2,9 +2,15 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from fastapi import HTTPException as FastAPIHTTPException
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from sglang.srt.entrypoints.http_server import _extract_validation_param, app
+from sglang.srt.entrypoints.http_server import (
+    _extract_validation_param,
+    app,
+    http_exception_handler,
+)
 
 
 client = TestClient(app)
@@ -91,3 +97,73 @@ def test_anthropic_pydantic_error_keeps_anthropic_envelope():
     assert body["error"]["type"] == "invalid_request_error"
     assert "object" not in body["error"]
     assert "param" not in body["error"]
+
+
+def _assert_openai_http_error(response, *, status_code, message, error_type):
+    assert response.status_code == status_code
+    assert response.json() == {
+        "error": {
+            "object": "error",
+            "message": message,
+            "type": error_type,
+            "param": None,
+            "code": status_code,
+        }
+    }
+
+
+def test_starlette_http_exception_handler_registration():
+    assert app.exception_handlers[StarletteHTTPException] is http_exception_handler
+    assert issubclass(FastAPIHTTPException, StarletteHTTPException)
+
+
+def test_framework_404_uses_openai_envelope():
+    response = client.get("/route-that-does-not-exist")
+
+    _assert_openai_http_error(
+        response, status_code=404, message="Not Found", error_type="404"
+    )
+
+
+def test_framework_405_uses_openai_envelope_and_preserves_allow_header():
+    response = client.get("/v1/chat/completions")
+
+    _assert_openai_http_error(
+        response,
+        status_code=405,
+        message="Method Not Allowed",
+        error_type="405",
+    )
+    assert response.headers["allow"] == "POST"
+
+
+def test_responses_framework_404_keeps_status_phrase_type():
+    response = client.get("/v1/responses/does-not-exist/extra")
+
+    _assert_openai_http_error(
+        response, status_code=404, message="Not Found", error_type="Not Found"
+    )
+
+
+def test_fastapi_http_exception_subclass_uses_registered_handler():
+    response = client.get("/weight_version")
+
+    _assert_openai_http_error(
+        response,
+        status_code=404,
+        message=(
+            "Endpoint '/get_weight_version' or '/weight_version' is deprecated. "
+            "Please use '/model_info' instead."
+        ),
+        error_type="404",
+    )
+
+
+def test_anthropic_framework_404_keeps_anthropic_envelope():
+    response = client.get("/v1/messages/does-not-exist")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "type": "error",
+        "error": {"type": "not_found_error", "message": "Not Found"},
+    }

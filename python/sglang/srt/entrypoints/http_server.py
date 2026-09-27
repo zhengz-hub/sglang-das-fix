@@ -62,6 +62,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -548,13 +549,15 @@ def _extract_validation_param(errors: list[dict]) -> Optional[str]:
     return param or None
 
 
-@app.exception_handler(HTTPException)
-async def validation_exception_handler(request: Request, exc: HTTPException):
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(
+    request: Request,
+    exc: StarletteHTTPException,
+):
     """Enrich HTTP exception with status code and other details.
 
-    For /v1/responses, emit OpenAI-style nested error envelope:
-    {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
+    All other paths use an OpenAI-style nested error envelope.
     """
     if request.url.path.startswith("/v1/messages"):
         # Map HTTP status to Anthropic error.type; fall back to api_error.
@@ -583,25 +586,24 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
             message=message,
         )
 
-    # adjust fmt for responses api
-    if request.url.path.startswith("/v1/responses"):
-        nested_error = {
-            "message": exc.detail,
-            "type": HTTPStatus(exc.status_code).phrase,
-            "param": None,
-            "code": exc.status_code,
-        }
-        return ORJSONResponse(
-            content={"error": nested_error}, status_code=exc.status_code
-        )
+    error_type = (
+        HTTPStatus(exc.status_code).phrase
+        if request.url.path.startswith("/v1/responses")
+        else str(exc.status_code)
+    )
 
     error = ErrorResponse(
         object="error",
         message=exc.detail,
-        type=str(exc.status_code),
+        type=error_type,
+        param=None,
         code=exc.status_code,
     )
-    return ORJSONResponse(content=error.model_dump(), status_code=exc.status_code)
+    return ORJSONResponse(
+        content={"error": error.model_dump()},
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
 
 
 # Custom exception handlers to change validation error status codes
