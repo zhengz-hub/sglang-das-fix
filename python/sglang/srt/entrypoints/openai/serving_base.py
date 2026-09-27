@@ -6,6 +6,7 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
+import msgspec
 import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -20,6 +21,11 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+class RequestValidationDetail(msgspec.Struct, frozen=True, kw_only=True):
+    message: str
+    param: Optional[str] = None
 
 
 # Base class for specific endpoint handlers
@@ -80,9 +86,12 @@ class OpenAIServingBase(ABC):
 
         try:
             # Validate request
-            error_msg = self._validate_request(request)
-            if error_msg:
-                return self.create_error_response(error_msg)
+            validation_error = self._validate_request_detail(request)
+            if validation_error:
+                return self.create_error_response(
+                    message=validation_error.message,
+                    param=validation_error.param,
+                )
 
             # Log the raw OpenAI request payload before conversion to tokenized form.
             request_logger = self.tokenizer_manager.request_logger
@@ -192,6 +201,15 @@ class OpenAIServingBase(ABC):
     def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
+
+    def _validate_request_detail(
+        self,
+        request: OpenAIServingRequest,
+    ) -> Optional[RequestValidationDetail]:
+        message = self._validate_request(request)
+        if message is None:
+            return None
+        return RequestValidationDetail(message=message, param=None)
 
     def create_error_response(
         self,

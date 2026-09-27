@@ -103,6 +103,9 @@ class _MockTokenizerManager:
         self.server_args = Mock(
             model_path="deepseek-ai/DeepSeek-V4-Flash",
             revision=None,
+            context_length=4096,
+            allow_auto_truncate=False,
+            disaggregation_mode="null",
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
@@ -256,8 +259,9 @@ class ServingChatTestCase(unittest.TestCase):
                 )
                 error = json.loads(response.body)
                 self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
-                self.assertEqual(error["type"], "BadRequestError")
-                self.assertIn(media_type, error["message"])
+                self.assertEqual(error["error"]["type"], "BadRequestError")
+                self.assertEqual(error["error"]["param"], "messages")
+                self.assertIn(media_type, error["error"]["message"])
         self.tm.generate_request.assert_not_called()
 
     def test_dsv4_rejects_non_leading_system_message_by_default(self):
@@ -272,8 +276,11 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         error = self.chat._validate_request(request)
+        detail = self.chat._validate_request_detail(request)
 
         self.assertIn("non-leading system message", error)
+        self.assertEqual(detail.message, error)
+        self.assertEqual(detail.param, "messages[1].role")
         self.assertEqual(request.messages[1].role, "system")
 
     def test_dsv4_can_remap_non_leading_system_message_to_developer(self):
@@ -443,6 +450,159 @@ class ServingChatTestCase(unittest.TestCase):
             self.chat._validate_request(req),
             "return_sampling_mask requires return_meta_info=true.",
         )
+        self.assertEqual(
+            self.chat._validate_request_detail(req).param, "return_sampling_mask"
+        )
+
+    def test_validate_request_detail_preserves_sampling_error_contracts(self):
+        cases = [
+            (
+                {"max_tokens": -1},
+                "max_new_tokens must be at least 0, got -1.",
+                "max_tokens",
+            ),
+            (
+                {"max_completion_tokens": -1},
+                "max_new_tokens must be at least 0, got -1.",
+                "max_completion_tokens",
+            ),
+            (
+                {"temperature": -1},
+                "temperature must be a non-negative finite number, got -1.0.",
+                "temperature",
+            ),
+            (
+                {"temperature": float("inf")},
+                "temperature must be a non-negative finite number, got inf.",
+                "temperature",
+            ),
+            ({"top_p": 0}, "top_p must be in (0, 1], got 0.0.", "top_p"),
+            ({"top_p": 1.1}, "top_p must be in (0, 1], got 1.1.", "top_p"),
+        ]
+
+        for values, message, param in cases:
+            with self.subTest(values=values):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    **values,
+                )
+                detail = self.chat._validate_request_detail(request)
+                self.assertEqual(detail.message, message)
+                self.assertEqual(detail.param, param)
+                self.assertEqual(self.chat._validate_request(request), message)
+
+    def test_validate_request_detail_preserves_max_token_selection(self):
+        selected_completion = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_completion_tokens=10,
+            max_tokens=-1,
+        )
+        zero_completion = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_completion_tokens=0,
+            max_tokens=-1,
+        )
+
+        self.assertIsNone(self.chat._validate_request_detail(selected_completion))
+        detail = self.chat._validate_request_detail(zero_completion)
+        self.assertEqual(detail.param, "max_tokens")
+        self.assertEqual(
+            detail.message, "max_new_tokens must be at least 0, got -1."
+        )
+
+    def test_validate_request_detail_does_not_blame_model_sampling_defaults(self):
+        self.chat.default_sampling_params = {"temperature": -1, "top_p": 0}
+        omitted = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        explicit_zero_temperature = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            temperature=0,
+        )
+
+        self.assertIsNone(self.chat._validate_request_detail(omitted))
+        self.assertIsNone(
+            self.chat._validate_request_detail(explicit_zero_temperature)
+        )
+
+    def test_validate_request_detail_keeps_context_limit_param_none(self):
+        self.tm.server_args.context_length = 10
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=11,
+        )
+
+        detail = self.chat._validate_request_detail(request)
+
+        self.assertIsNone(detail.param)
+        self.assertEqual(
+            detail.message,
+            "max_completion_tokens is too large: 11."
+            "This model supports at most 10 completion tokens.",
+        )
+
+    def test_validate_request_detail_reports_nested_tool_schema_path(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {"type": "not-a-json-schema-type"},
+                    },
+                }
+            ],
+        )
+
+        detail = self.chat._validate_request_detail(request)
+
+        self.assertIn("invalid 'parameters' schema", detail.message)
+        self.assertEqual(detail.param, "tools[0].function.parameters")
+
+    def test_validate_media_content_keeps_string_interface(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/image.png"},
+                        }
+                    ],
+                }
+            ],
+        )
+
+        error = self.chat._validate_media_content(request)
+
+        self.assertIsInstance(error, str)
+        self.assertIn("image_url", error)
+
+    def test_conversion_value_error_keeps_param_none(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            return_token_ids=True,
+        )
+
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat.handle_request(request, self.fastapi_request)
+        )
+        error = json.loads(response.body)["error"]
+
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertEqual(error["type"], "BadRequest")
+        self.assertIsNone(error["param"])
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(

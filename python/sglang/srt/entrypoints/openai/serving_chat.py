@@ -64,7 +64,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    RequestValidationDetail,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -908,9 +911,17 @@ class OpenAIServingChat(OpenAIServingBase):
         return tool_choice
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
+        detail = self._validate_request_detail(request)
+        return detail.message if detail else None
+
+    def _validate_request_detail(
+        self, request: ChatCompletionRequest
+    ) -> Optional[RequestValidationDetail]:
         """Validate that the input is valid."""
         if not request.messages:
-            return "Messages cannot be empty."
+            return RequestValidationDetail(
+                message="Messages cannot be empty.", param="messages"
+            )
 
         # The native DSV4 encoder treats a non-leading system message as raw
         # continuation text and may omit the assistant generation prefix. The
@@ -930,10 +941,13 @@ class OpenAIServingChat(OpenAIServingBase):
             if non_leading_system_indices:
                 if not envs.SGLANG_DSV4_REMAP_NON_LEADING_SYSTEM_TO_DEVELOPER.get():
                     indices = ", ".join(map(str, non_leading_system_indices))
-                    return (
-                        "DeepSeek-V4 chat encoding only supports a system message "
-                        "in the leading position; found non-leading system message "
-                        f"at index(es): {indices}."
+                    return RequestValidationDetail(
+                        message=(
+                            "DeepSeek-V4 chat encoding only supports a system message "
+                            "in the leading position; found non-leading system message "
+                            f"at index(es): {indices}."
+                        ),
+                        param=f"messages[{non_leading_system_indices[0]}].role",
                     )
                 for index in non_leading_system_indices:
                     request.messages[index] = request.messages[index].model_copy(
@@ -941,11 +955,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
 
         if request.return_sampling_mask and not request.return_meta_info:
-            return "return_sampling_mask requires return_meta_info=true."
+            return RequestValidationDetail(
+                message="return_sampling_mask requires return_meta_info=true.",
+                param="return_sampling_mask",
+            )
 
         media_error = self._validate_media_content(request)
         if media_error:
-            return media_error
+            return RequestValidationDetail(message=media_error, param="messages")
 
         effective_tools = self._effective_tools(request)
         has_message_tools = any(
@@ -959,22 +976,36 @@ class OpenAIServingChat(OpenAIServingBase):
             and request.tool_choice.lower() == "required"
             and not effective_tools
         ):
-            return "Tools cannot be empty if tool choice is set to required."
+            return RequestValidationDetail(
+                message="Tools cannot be empty if tool choice is set to required.",
+                param="tools",
+            )
 
         if request.tool_choice is not None and not isinstance(request.tool_choice, str):
             if not effective_tools:
-                return "Tools cannot be empty if tool choice is set to a specific tool."
+                return RequestValidationDetail(
+                    message=(
+                        "Tools cannot be empty if tool choice is set to a specific tool."
+                    ),
+                    param="tools",
+                )
             tool_name = request.tool_choice.function.name
             tool_exists = any(
                 tool.function.name == tool_name for tool in effective_tools
             )
             if not tool_exists:
-                return f"Tool '{tool_name}' not found in tools list."
+                return RequestValidationDetail(
+                    message=f"Tool '{tool_name}' not found in tools list.",
+                    param="tool_choice",
+                )
 
         if has_message_tools:
             names = [tool.function.name for tool in effective_tools]
             if len(names) != len(set(names)):
-                return "Tool names must be unique across request and message tools."
+                return RequestValidationDetail(
+                    message="Tool names must be unique across request and message tools.",
+                    param="tools",
+                )
 
         # Validate tool definitions
         for i, tool in enumerate(effective_tools):
@@ -988,11 +1019,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 normalize_json_schema_types(tool.function.parameters)
                 Draft202012Validator.check_schema(tool.function.parameters)
             except SchemaError as e:
-                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+                return RequestValidationDetail(
+                    message=(
+                        f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+                    ),
+                    param=f"tools[{i}].function.parameters",
+                )
             except RecursionError:
-                return (
-                    f"Tool {i} function 'parameters' schema is too deeply nested "
-                    "or contains a cycle."
+                return RequestValidationDetail(
+                    message=(
+                        f"Tool {i} function 'parameters' schema is too deeply nested "
+                        "or contains a cycle."
+                    ),
+                    param=f"tools[{i}].function.parameters",
                 )
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
@@ -1002,15 +1041,49 @@ class OpenAIServingChat(OpenAIServingBase):
             and server_context_length
             and max_output_tokens > server_context_length
         ) and not self.tokenizer_manager.server_args.allow_auto_truncate:
-            return (
-                f"max_completion_tokens is too large: {max_output_tokens}."
-                f"This model supports at most {server_context_length} completion tokens."
+            return RequestValidationDetail(
+                message=(
+                    f"max_completion_tokens is too large: {max_output_tokens}."
+                    f"This model supports at most {server_context_length} completion tokens."
+                ),
+                param=None,
             )
 
         if request.response_format and request.response_format.type == "json_schema":
             schema = getattr(request.response_format.json_schema, "schema_", None)
             if schema is None:
-                return "schema_ is required for json_schema response format request."
+                return RequestValidationDetail(
+                    message="schema_ is required for json_schema response format request.",
+                    param="response_format.json_schema.schema",
+                )
+
+        max_output_tokens_param = (
+            "max_completion_tokens" if request.max_completion_tokens else "max_tokens"
+        )
+        if max_output_tokens is not None and max_output_tokens < 0:
+            return RequestValidationDetail(
+                message=f"max_new_tokens must be at least 0, got {max_output_tokens}.",
+                param=max_output_tokens_param,
+            )
+
+        if request.temperature is not None:
+            temperature = request.temperature
+            if not math.isfinite(temperature) or temperature < 0.0:
+                return RequestValidationDetail(
+                    message=(
+                        "temperature must be a non-negative finite number, "
+                        f"got {temperature}."
+                    ),
+                    param="temperature",
+                )
+
+        if request.top_p is not None:
+            top_p = request.top_p
+            if not 0.0 < top_p <= 1.0:
+                return RequestValidationDetail(
+                    message=f"top_p must be in (0, 1], got {top_p}.",
+                    param="top_p",
+                )
 
         return None
 

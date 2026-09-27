@@ -530,6 +530,24 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
     )
 
 
+def _extract_validation_param(errors: list[dict]) -> Optional[str]:
+    if not errors:
+        return None
+
+    loc = errors[0].get("loc") or ()
+    if loc and loc[0] in ("body", "query", "path", "header"):
+        loc = loc[1:]
+
+    param = ""
+    for part in loc:
+        if isinstance(part, str) and part:
+            param += ("." if param else "") + part
+        elif isinstance(part, int) and not isinstance(part, bool):
+            param += f"[{part}]"
+
+    return param or None
+
+
 @app.exception_handler(HTTPException)
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
@@ -593,8 +611,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     For /v1/messages, emit Anthropic-style envelope and scrub the message so
     file paths or Python internals from the default ``str(exc)`` representation
-    never reach the client. For /v1/responses, keep OpenAI-style. Otherwise
-    use the legacy ErrorResponse shape.
+    never reach the client. Otherwise use the OpenAI-style nested envelope.
     """
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
@@ -611,25 +628,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     else:
         message = exc_str
 
-    if request.url.path.startswith("/v1/responses"):
-        # adapt specially, for v1/responses API only (notice the error key is different)
-        nested_error = {
-            "message": message,
-            "type": HTTPStatus.BAD_REQUEST.phrase,
-            "param": None,
-            "code": HTTPStatus.BAD_REQUEST.value,
-        }
-        return ORJSONResponse(status_code=400, content={"error": nested_error})
-
     err = ErrorResponse(
+        object="error",
         message=message,
         type=HTTPStatus.BAD_REQUEST.phrase,
+        param=_extract_validation_param(exc.errors()),
         code=HTTPStatus.BAD_REQUEST.value,
     )
 
     return ORJSONResponse(
         status_code=400,
-        content=err.model_dump(),
+        content={"error": err.model_dump()},
     )
 
 

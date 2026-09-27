@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -506,7 +507,9 @@ class MultimodalRequestTestCase(CustomTestCase):
         response = asyncio.run(serving.create_responses(request))
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn(b"received unsupported content type 'image_url'", response.body)
+        error = json.loads(response.body)["error"]
+        self.assertIn("received unsupported content type 'image_url'", error["message"])
+        self.assertIsNone(error["param"])
         serving._process_messages.assert_not_called()
         serving.tokenizer_manager.generate_request.assert_not_called()
 
