@@ -126,11 +126,11 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
                 temperature=0,
             )
 
-        # context length is checked first, then max_req_input_len, which is calculated from the former
+        # Accept rejection during multimodal expansion or tokenizer length validation.
         assert (
             "Multimodal prompt is too long after expanding multimodal tokens."
             in str(cm.exception)
-            or "is longer than the model's context length" in str(cm.exception)
+            or "is longer than the server's maximum allowed length" in str(cm.exception)
         )
 
 
