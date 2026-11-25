@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -189,8 +190,14 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert attn_dp_size == 1, (
             "For round-robin split mode, dp attention is not supported."
         )
-        assert cfg.tp_size <= 8, (
-            "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+        hcu_dsv41_cp16 = (
+            _is_hcu
+            and cfg.tp_size == 16
+            and os.environ.get("SGLANG_HCU_DSV41_CP16") == "1"
+        )
+        assert cfg.tp_size <= 8 or hcu_dsv41_cp16, (
+            "Context parallel requires tp_size <= 8, or HCU TP16 with "
+            "SGLANG_HCU_DSV41_CP16=1."
         )
     supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
